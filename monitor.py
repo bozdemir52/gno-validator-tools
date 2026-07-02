@@ -80,17 +80,11 @@ def send_alert(text):
 
 def monitor_gno_logs():
     """
-    Verified against real `journalctl -u gnoland` output on 2026-07-02:
-    - Healthy block commit shows up as: "Finalizing commit of block" (module: consensus)
-    - "Timed out" (RoundStepPropose) is NORMAL BFT round mechanics, not a failure -
-      it happens routinely even on healthy non-proposer validators. Ignored on purpose.
-    - "unable to perform broadcast" / "unable to dial peer" (module: p2p) are frequent,
-      benign peer churn - NOT validator health issues. Ignored on purpose.
-    - Real problems are treated as: any ERROR-level line from the consensus module,
-      or an explicit signing/signature failure phrase.
+    STRICT FILTERING: Only triggers on absolute signing failures.
+    Ignores regular consensus timeouts, peer drops, and benign warnings.
     """
     global missed_block_counter, last_seen_signing_ok
-    print("[INFO] Gno TM2 log reader started...")
+    print("[INFO] Gno TM2 log reader started with STRICT filtering...")
     try:
         process = subprocess.Popen(
             ["journalctl", "-u", "gnoland", "-f", "-n", "0"],
@@ -99,15 +93,18 @@ def monitor_gno_logs():
         for line in process.stdout:
             line_lower = line.lower()
 
-            is_consensus_error = (
-                "error" in line_lower
-                and '"module": "consensus"' in line_lower
-            )
+            # Sadece KESİN imza veya yetki kaçırma loglarını say
             is_signing_failure = any(
-                k in line_lower for k in ("failed to sign", "wrong signature", "signature verification failed")
+                k in line_lower for k in (
+                    "failed to sign", 
+                    "wrong signature", 
+                    "signature verification failed",
+                    "missed block",
+                    "absent validator"
+                )
             )
 
-            if is_consensus_error or is_signing_failure:
+            if is_signing_failure:
                 missed_block_counter += 1
                 last_seen_signing_ok = False
             elif "finalizing commit of block" in line_lower:
@@ -140,7 +137,7 @@ def format_uptime(seconds):
 
 
 def build_status_report():
-    """Builds a Monad-Watchdog-style formatted report, adapted for Gno.land Test13."""
+    """Builds a formatted report, adapted for Gno.land Test13."""
     height, is_syncing, peers = get_gno_status()
     sync_str = "N/A"
     if is_syncing is not None:
@@ -150,10 +147,9 @@ def build_status_report():
 
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory().percent
-    disk = psutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/")
-    disk_used_gb = disk.used / (1024 ** 3)
-    disk_total_gb = disk.total / (1024 ** 3)
-    disk_pct = disk.percent
+    disk = psutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/").percent
+    disk_used_gb = psutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/").used / (1024 ** 3)
+    disk_total_gb = psutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/").total / (1024 ** 3)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -170,7 +166,7 @@ def build_status_report():
         f"-----------------------------\n"
         f"Server Health\n"
         f"CPU: {cpu}% | RAM: {ram}%\n"
-        f"Data Dir Disk: {disk_used_gb:.2f} GB / {disk_total_gb:.2f} GB ({disk_pct}%)\n"
+        f"Data Dir Disk: {disk_used_gb:.2f} GB / {disk_total_gb:.2f} GB ({disk}%)\n"
         f"Watchdog Uptime: {format_uptime(time.time() - START_TIME)}\n"
         f"-----------------------------"
     )
@@ -178,9 +174,7 @@ def build_status_report():
 
 
 def periodic_report_loop():
-    """Sends a heartbeat-style status report every REPORT_INTERVAL_SECONDS, like the
-    Monad watchdog's 'AUTOMATIC REPORT' - lets you confirm the node is alive even
-    when nothing is wrong, instead of only hearing from the bot during incidents."""
+    """Sends a heartbeat-style status report every REPORT_INTERVAL_SECONDS."""
     while True:
         time.sleep(REPORT_INTERVAL_SECONDS)
         try:
@@ -190,10 +184,7 @@ def periodic_report_loop():
 
 
 def telegram_command_listener():
-    """Listens for /start or /status typed in Telegram and replies immediately with
-    the same list-style report as the periodic heartbeat. Uses long polling
-    (getUpdates), so no webhook/public URL is needed. Only responds to messages
-    coming from the configured TELEGRAM_CHAT_ID, ignoring everything else."""
+    """Listens for /start or /status typed in Telegram and replies immediately."""
     offset = None
     print("[INFO] Telegram command listener started (/start, /status)...")
     while True:
@@ -225,7 +216,6 @@ def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
         print("[WARN] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are still placeholders!")
         print("[WARN] No alerts will actually reach Telegram until these env vars are set")
-        print("[WARN] (in THIS shell session) before running the script.")
     if VALIDATOR_MONIKER == "your-moniker":
         print("[WARN] VALIDATOR_MONIKER is still the default placeholder - set it via env var.")
 
