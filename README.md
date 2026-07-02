@@ -22,6 +22,7 @@ An automated system and configuration health-checker built strictly around the o
 ```bash
 chmod +x gno-doctor.sh
 ./gno-doctor.sh
+```
 🛡️ 2. Gno Node Watchdog (monitor.py)
 A high-performance Python daemon that continuously parses local TM2 consensus log streams via journalctl and monitors hardware thresholds. It immediately broadcasts critical infrastructure anomalies directly to your personal Telegram chat.
 
@@ -37,23 +38,31 @@ Interactive Status Checks: Responds seamlessly with an AUTOMATIC REPORT whenever
 How to Run:
 Install system prerequisites:
 
-Bash
+```Bash
 sudo apt update && sudo apt install python3-psutil python3-requests -y
+```
 Open an isolated screen environment to persist the daemon:
 
-Bash
+```Bash
 screen -S gno-watchdog
+```
 Export your operator variables and execute:
 
-Bash
+```Bash
 export TELEGRAM_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
 export TELEGRAM_CHAT_ID="YOUR_TELEGRAM_CHAT_ID"
 export VALIDATOR_MONIKER="pi69"
 
 python3 monitor.py
+```
 To detach safely from the screen, press Ctrl + A, then D.
 
 🔗 Connect With Us
+
+Mail: bozdemir52@gmail.com
+
+Tg: https://t.me/bahadir69
+
 Website: pi69.net
 
 Twitter/X: @bozdemir5269
