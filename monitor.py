@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Gno Node Watchdog v2.0 - RPC Precommit Engine & Telegram Alert Daemon
-Inspired by GnoDuty & Tenderduty, optimized for Gno.land Test13.
+Gno Node Watchdog - TM2 Consensus Log Parser & Telegram Alert Daemon
+Designed for Gno.land Test13 node operators.
 
 Configure via environment variables (recommended):
     export TELEGRAM_BOT_TOKEN="..."
     export TELEGRAM_CHAT_ID="..."
     export VALIDATOR_MONIKER="your-moniker"
-    export GNO_RPC_URL="http://localhost:26657"  # Change if you use a custom port (e.g. 32267)
-    export GNO_VALOPER_ADDRESS="g1..."          # Optional: auto-detected from RPC if omitted
+    export GNO_RPC_URL="http://localhost:54657"     # optional, auto-detected if omitted
+    export REPORT_INTERVAL_HOURS="6"                # periodic status report, like a heartbeat
 """
 import os
 import re
 import time
 import psutil
 import requests
+import subprocess
 import threading
 from datetime import datetime
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (env vars override these) ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 VALIDATOR_MONIKER = os.environ.get("VALIDATOR_MONIKER", "your-moniker")
@@ -31,7 +32,7 @@ START_TIME = time.time()
 
 
 def detect_rpc_url():
-    """Auto-detect the RPC port from config.toml, fall back to default."""
+    """Auto-detect the RPC port from config.toml's [rpc] laddr, fall back to env/default."""
     env_url = os.environ.get("GNO_RPC_URL")
     if env_url:
         return env_url
@@ -49,16 +50,16 @@ def detect_rpc_url():
 
 GNO_RPC_URL = detect_rpc_url()
 
-# --- ALERT THRESHOLDS ---
+# --- ALERT THRESHOLDS (env-configurable) ---
 ALERT_CPU_THRESHOLD = int(os.environ.get("ALERT_CPU_THRESHOLD", "95"))
 ALERT_DISK_THRESHOLD = int(os.environ.get("ALERT_DISK_THRESHOLD", "90"))
 ALERT_RAM_THRESHOLD = int(os.environ.get("ALERT_RAM_THRESHOLD", "90"))
-ALERT_TIMEOUT_THRESHOLD = 3  # Alert if validator misses 3 consecutive blocks
-CPU_SUSTAINED_CHECKS = 15
-HARDWARE_ALERT_COOLDOWN = 1800
+ALERT_TIMEOUT_THRESHOLD = 3  # Alert if node misses 3 consecutive blocks locally
+CPU_SUSTAINED_CHECKS = 15  # ~30s of sustained high CPU (at 2s polling) before alerting
+HARDWARE_ALERT_COOLDOWN = 1800  # 30 min between repeat hardware alerts, not 5 min
 
 missed_block_counter = 0
-last_seen_signing_ok = True
+last_seen_signing_ok = True  # tracked for the periodic report's "Node Status" line
 
 
 def telegram_api(method, data=None):
@@ -77,92 +78,44 @@ def send_alert(text):
     telegram_api("sendMessage", data)
 
 
-def detect_validator_address():
-    """Auto-detects the running node's validator address from local RPC."""
-    try:
-        status = requests.get(f"{GNO_RPC_URL}/status", timeout=3).json()
-        return status.get("result", {}).get("validator_info", {}).get("address")
-    except Exception:
-        return None
-
-
-def monitor_gno_rpc():
+def monitor_gno_logs():
     """
-    Advanced TM2 Precommit Inspection Engine.
-    Queries the actual blockchain state to check for real signing signatures.
-    Preserves state on RPC timeouts to prevent false alarms.
+    STRICT FILTERING: Only triggers on absolute signing failures.
+    Ignores regular consensus timeouts, peer drops, and benign warnings.
     """
     global missed_block_counter, last_seen_signing_ok
-    print("[INFO] Gno Duty-Style RPC Precommit Monitor started...")
+    print("[INFO] Gno TM2 log reader started with STRICT filtering...")
+    try:
+        process = subprocess.Popen(
+            ["journalctl", "-u", "gnoland", "-f", "-n", "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        for line in process.stdout:
+            line_lower = line.lower()
 
-    val_address = os.environ.get("GNO_VALOPER_ADDRESS")
-    if not val_address:
-        val_address = detect_validator_address()
+            # Sadece KESİN imza veya yetki kaçırma loglarını say
+            is_signing_failure = any(
+                k in line_lower for k in (
+                    "failed to sign", 
+                    "wrong signature", 
+                    "signature verification failed",
+                    "missed block",
+                    "absent validator"
+                )
+            )
 
-    if val_address:
-        print(f"[INFO] Target Validator Address Account: {val_address}")
-    else:
-        print("[WARN] Could not auto-detect validator address yet. Will retry in loop...")
-
-    last_checked_height = 0
-
-    while True:
-        time.sleep(1.5)  # Fast polling to track ledger blocks dynamically
-        try:
-            status_resp = requests.get(f"{GNO_RPC_URL}/status", timeout=3).json()
-            current_height = int(status_resp["result"]["sync_info"]["latest_block_height"])
-            is_syncing = status_resp["result"]["sync_info"]["catching_up"]
-
-            if not val_address:
-                val_address = status_resp.get("result", {}).get("validator_info", {}).get("address")
-                if val_address:
-                    print(f"[INFO] Auto-detected validator address successfully: {val_address}")
-
-            if current_height <= last_checked_height:
-                continue
-
-            if last_checked_height == 0:
-                last_checked_height = current_height
-                continue
-
-            # Scan missed block windows across newly discovered block range
-            for h in range(last_checked_height + 1, current_height + 1):
-                block_resp = requests.get(f"{GNO_RPC_URL}/block?height={h}", timeout=3).json()
-                last_commit = block_resp.get("result", {}).get("block", {}).get("last_commit", {})
-                precommits = last_commit.get("precommits", [])
-
-                if not precommits:
-                    continue
-
-                signed = False
-                if val_address:
-                    val_addr_lower = str(val_address).lower()
-                    for precommit in precommits:
-                        if precommit and isinstance(precommit, dict):
-                            addr = precommit.get("validator_address", "")
-                            if str(addr).lower() == val_addr_lower:
-                                signed = True
-                                break
-
-                if signed:
-                    missed_block_counter = 0
-                    last_seen_signing_ok = True
-                else:
-                    # Trigger miss logic only if we are fully synced and verified
-                    if val_address and not is_syncing:
-                        missed_block_counter += 1
-                        last_seen_signing_ok = False
-                        print(f"[WARN] Missed on-chain signature for block {h-1}! Consecutive total: {missed_block_counter}")
-
-            last_checked_height = current_height
-
-        except Exception as e:
-            # GnoDuty Rule: PRESERVE STATE ON RPC TIMEOUT/ERROR
-            # Node might be heavy loaded; don't change counter or alert false positives.
-            print(f"[WARN] RPC communication timeout or issue: {e}. Preserving current state safely.")
+            if is_signing_failure:
+                missed_block_counter += 1
+                last_seen_signing_ok = False
+            elif "finalizing commit of block" in line_lower:
+                missed_block_counter = 0
+                last_seen_signing_ok = True
+    except Exception as e:
+        print(f"[ERROR] Failed to read journalctl: {e}")
 
 
 def get_gno_status():
+    """Fetches local block height, sync status and peer count from Gno RPC"""
     try:
         status = requests.get(f"{GNO_RPC_URL}/status", timeout=3).json()
         height = int(status["result"]["sync_info"]["latest_block_height"])
@@ -184,6 +137,7 @@ def format_uptime(seconds):
 
 
 def build_status_report():
+    """Builds a formatted report, adapted for Gno.land Test13."""
     height, is_syncing, peers = get_gno_status()
     sync_str = "N/A"
     if is_syncing is not None:
@@ -220,6 +174,7 @@ def build_status_report():
 
 
 def periodic_report_loop():
+    """Sends a heartbeat-style status report every REPORT_INTERVAL_SECONDS."""
     while True:
         time.sleep(REPORT_INTERVAL_SECONDS)
         try:
@@ -229,6 +184,7 @@ def periodic_report_loop():
 
 
 def telegram_command_listener():
+    """Listens for /start or /status typed in Telegram and replies immediately."""
     offset = None
     print("[INFO] Telegram command listener started (/start, /status)...")
     while True:
@@ -245,7 +201,7 @@ def telegram_command_listener():
                 text = msg.get("text", "").strip().lower()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if chat_id != str(TELEGRAM_CHAT_ID):
-                    continue
+                    continue  # ignore commands from any other chat
                 if text in ("/start", "/status"):
                     send_alert(build_status_report())
         except Exception as e:
@@ -255,14 +211,17 @@ def telegram_command_listener():
 
 def main():
     global missed_block_counter
-    print(f"[INFO] Gno Node Watchdog Engine v2.0 Started for {VALIDATOR_MONIKER}...")
+    print(f"[INFO] Gno Node Watchdog started for {VALIDATOR_MONIKER} (RPC: {GNO_RPC_URL})...")
 
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
-        print("[WARN] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are placeholders!")
+        print("[WARN] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are still placeholders!")
+        print("[WARN] No alerts will actually reach Telegram until these env vars are set")
+    if VALIDATOR_MONIKER == "your-moniker":
+        print("[WARN] VALIDATOR_MONIKER is still the default placeholder - set it via env var.")
 
-    send_alert(f"[🟢 Watchdog Engine Up]\nValidator: `{VALIDATOR_MONIKER}` is now being verified via RPC block data streams.")
+    send_alert(f"[OK] Watchdog Started\nValidator: `{VALIDATOR_MONIKER}` is now being monitored locally.")
 
-    threading.Thread(target=monitor_gno_rpc, daemon=True).start()
+    threading.Thread(target=monitor_gno_logs, daemon=True).start()
     threading.Thread(target=telegram_command_listener, daemon=True).start()
     if REPORT_INTERVAL_SECONDS > 0:
         threading.Thread(target=periodic_report_loop, daemon=True).start()
@@ -286,12 +245,12 @@ def main():
                 stuck_counter = 0
             last_height = current_height
 
-        # 2. On-Chain Missed Block / Signature Window Alert
+        # 2. Missed Block / Timeout Alert
         if missed_block_counter >= ALERT_TIMEOUT_THRESHOLD:
-            send_alert(f"[🚨 VALIDATOR MISSED SIGNING]\nYour node missed `{missed_block_counter}` consecutive blocks on-chain! Investigate immediately.")
+            send_alert(f"[VALIDATOR ALERT]\nYour node just missed `{missed_block_counter}` consecutive signing windows! Check `gnoland` logs immediately.")
             missed_block_counter = 0
 
-        # 3. Hardware Resource Monitoring
+        # 3. Hardware Resource Monitoring (sustained-check to avoid alerting on brief spikes)
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
         disk = psutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/").percent
